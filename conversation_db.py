@@ -66,6 +66,16 @@ def init_db():
         )
     """)
     
+    # Channel status table - AI-maintained summary per channel
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channel_status (
+            channel_id INTEGER PRIMARY KEY,
+            channel_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     # Create indexes
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_channel_timestamp 
@@ -355,4 +365,75 @@ def format_recent_happenings() -> str:
     if not happenings:
         return ""
     return f"Recent happenings across the server:\n{happenings}"
+
+# Channel status functions - AI-maintained summaries per channel
+def get_channel_status(channel_id: int) -> Optional[str]:
+    """Get the AI-maintained status for a channel."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT status FROM channel_status WHERE channel_id = ? 
+        ORDER BY updated_at DESC LIMIT 1
+    """, (channel_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    return row['status'] if row else None
+
+def set_channel_status(channel_id: int, channel_name: str, status: str):
+    """Set/update the AI-maintained status for a channel."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    timestamp = datetime.datetime.now().isoformat()
+    
+    cursor.execute("""
+        INSERT INTO channel_status (channel_id, channel_name, status, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            status = excluded.status,
+            channel_name = excluded.channel_name,
+            updated_at = excluded.updated_at
+    """, (channel_id, channel_name, status, timestamp))
+    
+    conn.commit()
+    conn.close()
+
+def get_all_channel_statuses() -> List[Dict]:
+    """Get all channel statuses for cross-channel awareness."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT channel_id, channel_name, status, updated_at 
+        FROM channel_status 
+        ORDER BY updated_at DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    return [
+        {
+            'channel_id': row['channel_id'],
+            'channel_name': row['channel_name'],
+            'status': row['status'],
+            'updated_at': row['updated_at']
+        }
+        for row in rows
+    ]
+
+def format_channel_statuses(current_channel_id: int = None) -> str:
+    """Format all channel statuses for the prompt, marking current channel."""
+    statuses = get_all_channel_statuses()
+    
+    if not statuses:
+        return ""
+    
+    formatted = "Channel Statuses (your awareness of each channel):\n"
+    for s in statuses:
+        marker = " ← YOU ARE HERE" if s['channel_id'] == current_channel_id else ""
+        formatted += f"  #{s['channel_name']}: {s['status']}{marker}\n"
+    
+    return formatted
 

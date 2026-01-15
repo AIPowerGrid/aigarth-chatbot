@@ -1,6 +1,11 @@
 import os
+import re
+import json
+import asyncio
 import discord
 import datetime
+import requests
+from bs4 import BeautifulSoup
 from io import BytesIO
 from dotenv import load_dotenv
 from retriever import DocumentRetriever
@@ -8,26 +13,33 @@ from grid_client import GridClient
 from coingecko_mcp import get_crypto_context
 from conversation_db import (
     init_db, add_message, format_channel_history,
-    format_mood, format_memories, format_recent_happenings
+    format_mood, format_memories, format_recent_happenings,
+    get_channel_status, set_channel_status, format_channel_statuses
 )
 
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-DISCORD_CHANNELS = os.getenv('DISCORD_CHANNELS', '').split(',')
-ALLOWED_CHANNEL_IDS = []
-for channel_id in DISCORD_CHANNELS:
-    if channel_id.strip():
-        try:
-            ALLOWED_CHANNEL_IDS.append(int(channel_id.strip()))
-        except ValueError:
-            print(f"Warning: Invalid channel ID '{channel_id}', skipping")
 
-LISTENING_CHANNEL_ID = 0
-try:
-    LISTENING_CHANNEL_ID = int(os.getenv('LISTENING_CHANNEL_ID', '0'))
-except ValueError:
-    print(f"Warning: Invalid LISTENING_CHANNEL_ID, using 0")
+# Parse channel lists
+def parse_channel_ids(env_var: str) -> list:
+    """Parse comma-separated channel IDs from env var."""
+    ids = []
+    for channel_id in os.getenv(env_var, '').split(','):
+        if channel_id.strip():
+            try:
+                ids.append(int(channel_id.strip()))
+            except ValueError:
+                print(f"Warning: Invalid channel ID '{channel_id}' in {env_var}, skipping")
+    return ids
+
+# Active channels: bot responds + stores in vector DB
+BOT_CHANNELS = parse_channel_ids('BOT_CHANNELS')
+# Read-only channels: bot stores in vector DB but doesn't respond  
+BOT_READONLY_CHANNELS = parse_channel_ids('BOT_READONLY_CHANNELS')
+# Combined: all channels bot should store messages from
+ALL_BOT_CHANNELS = set(BOT_CHANNELS + BOT_READONLY_CHANNELS)
+
 BOT_NAME = os.getenv('BOT_NAME', 'ask-ai')  # Configurable bot name
 admin_id_str = os.getenv('ADMIN_USER_ID', '0')
 print(f"Admin ID from env: '{admin_id_str}'")
@@ -48,10 +60,6 @@ client = discord.Client(intents=intents)
 # Initialize document retriever and Grid client
 retriever = DocumentRetriever()
 grid_client = GridClient()
-
-# Store conversation history
-channel_message_history = {}
-MAX_MESSAGE_HISTORY = 10  # Number of messages to remember per channel
 
 # Scam detection and voting
 BAN_VOTE_THRESHOLD = 3  # Number of upvotes needed to ban
@@ -74,203 +82,206 @@ async def on_ready():
     
     print(f'Logged in as {client.user} (ID: {client.user.id})')
     print(f'Bot name: {BOT_NAME}')
-    print(f'Listening in ALL channels for automatic responses')
-    print(f'Admin commands allowed in channels: {ALLOWED_CHANNEL_IDS}')
+    print(f'Active channels (respond + store): {BOT_CHANNELS}')
+    print(f'Read-only channels (store only): {BOT_READONLY_CHANNELS}')
     print(f'Admin user ID: {ADMIN_USER_ID}')
     print('------')
 
-def get_channel_history(channel_id):
-    """Get the conversation history for a channel."""
-    if channel_id not in channel_message_history:
-        channel_message_history[channel_id] = []
-    return channel_message_history[channel_id]
-
-# add_to_channel_history is now handled by add_message from conversation_db
-
-# format_channel_history is now imported from conversation_db
-
 def extract_urls_from_message(message_content: str) -> list[str]:
     """Extract all URLs from a message."""
-    import re
     url_patterns = [
-        r'https?://[^\s\)]+',  # Match URLs, stop at whitespace or closing paren
-        r'www\.[^\s\)]+',
+        r'https?://[^\s\)\]>]+',  # Match URLs, stop at whitespace/paren/bracket
+        r'www\.[^\s\)\]>]+',
+        r'discord\.gg/[^\s\)\]>]+',  # Discord invites without https
+        r'discord\.com/invite/[^\s\)\]>]+',  # Discord invites alternate format
     ]
     
     urls = []
     for pattern in url_patterns:
-        matches = re.findall(pattern, message_content)
+        matches = re.findall(pattern, message_content, re.IGNORECASE)
         urls.extend(matches)
     
-    return urls
+    # Deduplicate while preserving order
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url.lower() not in seen:
+            seen.add(url.lower())
+            unique_urls.append(url)
+    
+    return unique_urls
 
-def is_forbidden_link_type(url: str, message_content: str) -> tuple[bool, str]:
-    """Check if a URL is a forbidden type (DEX, DeFi, support, Discord invite).
-    Returns (is_forbidden, reason)"""
-    import re
-    url_lower = url.lower()
-    content_lower = message_content.lower()
+def extract_opengraph(url: str, timeout: int = 5) -> dict:
+    """Extract OpenGraph metadata from a URL for AI context."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'
+    }
     
-    # Discord invites (always forbidden)
-    discord_patterns = [
-        r'discord\.gg/',
-        r'discord\.com/invite/',
-        r'discordapp\.com/invite/',
-    ]
-    for pattern in discord_patterns:
-        if re.search(pattern, url_lower):
-            return True, "posted a Discord invite link"
-    
-    # Support ticket/help desk links
-    support_keywords = ['support', 'help', 'ticket', 'helpdesk', 'zendesk', 'freshdesk']
-    support_domains = ['support', 'help', 'ticket', 'helpdesk']
-    if any(keyword in url_lower for keyword in support_keywords) or any(domain in url_lower for domain in support_domains):
-        return True, "posted a support ticket/help link"
-    
-    # DEX (Decentralized Exchange) links
-    dex_keywords = ['dex', 'uniswap', 'pancakeswap', 'sushiswap', '1inch', 'dydx', 'curve', 'balancer', 'kyberswap']
-    dex_domains = ['uniswap', 'pancakeswap', 'sushiswap', '1inch', 'dydx', 'curve.fi', 'balancer', 'kyberswap']
-    if any(keyword in url_lower for keyword in dex_keywords) or any(domain in url_lower for domain in dex_domains):
-        return True, "posted a DEX (decentralized exchange) link"
-    
-    # DeFi platform links
-    defi_keywords = ['defi', 'lending', 'borrowing', 'yield', 'farm', 'staking', 'liquidity', 'pool']
-    defi_domains = ['aave', 'compound', 'makerdao', 'yearn', 'convex', 'frax']
-    if any(keyword in url_lower for keyword in defi_keywords) or any(domain in url_lower for domain in defi_domains):
-        # But allow if it's clearly about AIPG staking/pools (legitimate)
-        if 'aipg' in content_lower or 'aipowergrid' in content_lower or 'power grid' in content_lower:
-            return False, ""
-        return True, "posted a DeFi platform link"
-    
-    return False, ""
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return {}
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        og_data = {}
+        
+        for tag in soup.find_all('meta'):
+            prop = tag.get('property', '') or tag.get('name', '')
+            content = tag.get('content', '')
+            if prop in ['og:title', 'og:description', 'og:site_name', 'twitter:title', 'twitter:description']:
+                og_data[prop] = content[:500]  # Limit length
+        
+        return og_data
+    except Exception as e:
+        print(f"OpenGraph extraction failed for {url}: {e}")
+        return {}
 
-def detect_discord_invite(message_content: str) -> tuple[bool, str]:
-    """Quick check for Discord invites (always flag these)."""
-    import re
-    content_lower = message_content.lower()
+def format_link_context(urls: list[str]) -> str:
+    """Extract and format OpenGraph data for all URLs in a message."""
+    if not urls:
+        return ""
     
-    discord_invite_patterns = [
-        r'discord\.gg/\w+',
-        r'discord\.com/invite/\w+',
-        r'discordapp\.com/invite/\w+',
-    ]
+    link_info = []
+    for url in urls[:3]:  # Limit to 3 URLs to avoid slowdown
+        og = extract_opengraph(url)
+        if og:
+            title = og.get('og:title') or og.get('twitter:title', '')
+            desc = og.get('og:description') or og.get('twitter:description', '')
+            site = og.get('og:site_name', '')
+            
+            info = f"Link: {url}"
+            if site:
+                info += f"\n  Site: {site}"
+            if title:
+                info += f"\n  Title: {title}"
+            if desc:
+                info += f"\n  Description: {desc[:200]}..."
+            link_info.append(info)
+        else:
+            link_info.append(f"Link: {url} (no preview available)")
     
-    for pattern in discord_invite_patterns:
-        if re.search(pattern, content_lower):
-            return True, "posted a Discord invite link"
-    
-    return False, ""
+    if link_info:
+        return "\n\n=== LINK PREVIEWS ===\n" + "\n\n".join(link_info)
+    return ""
 
-async def analyze_link_with_ai(message_content: str, urls: list[str]) -> tuple[bool, str]:
-    """Use AI Power Grid to analyze if a message with links is a scam."""
-    import json
+async def analyze_message_for_scam(message_content: str, urls: list[str]) -> tuple[bool, str]:
+    """Use AI Power Grid to analyze if a message with links is a scam.
+    AI has full context about trusted domains and scam patterns."""
     
     urls_text = "\n".join([f"- {url}" for url in urls])
     
-    analysis_prompt = f"""
-You are a security bot analyzing Discord messages for scams and phishing attempts.
+    analysis_prompt = f"""You are a security bot for the AI Power Grid Discord server. Analyze this message and decide if it's a scam.
 
-Analyze this message and determine if it's a scam:
-
-MESSAGE:
-"{message_content}"
+MESSAGE: "{message_content}"
 
 LINKS IN MESSAGE:
 {urls_text}
 
-Common scam patterns to look for:
-- Fake support tickets or help desk links
-- Fake airdrop or token claim links
-- Fake DEX (decentralized exchange) links
-- Fake wallet verification or migration links
-- Phishing sites trying to steal credentials
-- Suspicious domains that don't match official services
-- Urgent language trying to get users to click quickly
-- Promises of free tokens, airdrops, or rewards
+TRUSTED DOMAINS (always safe, never flag these):
+- aipowergrid.io, aipg (anything with aipg/aipowergrid)
+- Block explorers: etherscan.io, polygonscan.com, basescan.org, bscscan.com, arbiscan.io, snowtrace.io, ftmscan.com
+- Price trackers: coingecko.com, coinmarketcap.com, coinpaprika.com, livecoinwatch.com
+- DEXes: uniswap.org, pancakeswap.finance, aerodrome.finance, curve.fi, balancer.fi, sushi.com, 1inch.io
+- L2/Superchain: base.org, optimism.io, arbitrum.io, zksync.io
+- Crypto tools: dextools.io, dexscreener.com, defined.fi
+- Social: github.com, twitter.com, x.com, medium.com, reddit.com, youtube.com
 
-Return ONLY a JSON object with this exact format:
-{{"is_scam": true/false, "reason": "brief explanation of why it's suspicious or safe"}}
+ALWAYS FLAG AS SCAM:
+- Discord invite links (discord.gg, discord.com/invite) - we don't allow server invites
+- Fake support/help desk links (zendesk, freshdesk, "support ticket" sites not from trusted domains)
+- Wallet verification or migration scams
+- Fake airdrop claim sites
+- Phishing sites impersonating legitimate services
 
-If it's a scam, be specific about what type (e.g., "fake support ticket link", "suspicious airdrop claim", "phishing site", etc.).
-If it's safe, reason should be something like "appears to be legitimate" or "no scam indicators detected".
+SAFE - DO NOT FLAG:
+- Links to any trusted domain listed above
+- Normal crypto discussion with legitimate links
+- News articles, documentation, tutorials
 
-Only return the JSON object, nothing else.
-"""
+Return ONLY a JSON object:
+{{"is_scam": true/false, "reason": "brief explanation"}}
+
+Be specific in reason (e.g., "Discord invite link", "fake support site", "trusted DEX link - safe").
+Only return the JSON, nothing else."""
     
     try:
         result = await grid_client.get_answer(analysis_prompt, [])
-        print(f"AI Scam Analysis Response: '{result}'")
+        print(f"🤖 AI Scam Analysis: '{result}'")
         
-        # Try to extract JSON from response
+        # Parse JSON response
         result_clean = result.strip()
-        
-        # Remove markdown code blocks if present
         if result_clean.startswith('```'):
             result_clean = result_clean.split('```')[1]
             if result_clean.startswith('json'):
                 result_clean = result_clean[4:]
-        
         result_clean = result_clean.strip()
         
-        # Parse JSON
         analysis = json.loads(result_clean)
-        
-        is_scam = analysis.get('is_scam', False)
-        reason = analysis.get('reason', 'analyzed by AI')
-        
-        return is_scam, reason
+        return analysis.get('is_scam', False), analysis.get('reason', 'analyzed by AI')
         
     except json.JSONDecodeError as e:
-        print(f"Failed to parse AI scam analysis JSON: {e}")
-        print(f"Raw response: '{result}'")
-        # If AI fails, default to flagging it (safer)
+        print(f"Failed to parse AI response: {e}, raw: '{result}'")
+        # Only flag if it looks suspicious - don't flag on parse errors for trusted domains
+        for trusted in ['aipg', 'etherscan', 'coingecko', 'uniswap', 'github', 'twitter']:
+            if any(trusted in url.lower() for url in urls):
+                return False, "parse error but trusted domain detected"
         return True, "AI analysis failed - flagged for review"
     except Exception as e:
         print(f"Error in AI scam analysis: {e}")
-        # If AI fails, default to flagging it (safer)
         return True, "AI analysis error - flagged for review"
 
 async def handle_scam_detection(message):
-    """Handle detected scam messages by creating a vote."""
+    """Check message for scams using AI. Creates a ban vote if scam detected."""
     # Don't check admins
     if message.author.id == ADMIN_USER_ID:
-        print(f"⏭️  Skipping scam check for admin: {message.author.display_name}")
         return False
     
-    print(f"🔍 Checking message for scams: '{message.content[:100]}...' from {message.author.display_name}")
-    
-    # Check for URLs
+    # Extract URLs - no URLs means no scam check needed
     urls = extract_urls_from_message(message.content)
-    print(f"🔗 Extracted {len(urls)} URL(s): {urls}")
     
-    if not urls:
-        # No links, not a scam
-        print(f"⏭️  No URLs found in message, skipping scam check")
+    # Also check for Discord invite patterns that might be obfuscated
+    discord_invite_patterns = ['discord.gg', 'discord.com/invite', 'discordapp.com/invite']
+    has_discord_invite = any(pattern in message.content.lower() for pattern in discord_invite_patterns)
+    
+    if not urls and not has_discord_invite:
         return False
     
-    # Check each URL for forbidden types (DEX, DeFi, support, Discord invites)
-    is_scam = False
-    reason = ""
+    if has_discord_invite and not urls:
+        # Found invite pattern but no URL extracted - flag it anyway
+        urls = ["[obfuscated discord invite detected]"]
     
+    log_msg = f"🚨 SCAM CHECK: {len(urls)} URL(s) from {message.author.display_name}: {urls}"
+    print(log_msg, flush=True)
+    with open('bot.log', 'a') as f:
+        f.write(log_msg + '\n')
+    
+    # Let AI decide
+    is_scam, reason = await analyze_message_for_scam(message.content, urls)
+    
+    if not is_scam:
+        print(f"✅ AI says safe: {reason}")
+        return False
+    
+    # Redact URLs from the original message for evidence
+    redacted_content = message.content
     for url in urls:
-        is_forbidden, forbidden_reason = is_forbidden_link_type(url, message.content)
-        if is_forbidden:
-            print(f"🚨 Forbidden link type detected: {forbidden_reason} - URL: {url}")
-            is_scam = True
-            reason = forbidden_reason
-            break
+        if url != "[obfuscated discord invite detected]":
+            redacted_content = redacted_content.replace(url, "[LINK REDACTED]")
+    # Also redact any remaining discord invite patterns
+    redacted_content = re.sub(r'discord\.gg/\S+', '[LINK REDACTED]', redacted_content, flags=re.IGNORECASE)
+    redacted_content = re.sub(r'discord\.com/invite/\S+', '[LINK REDACTED]', redacted_content, flags=re.IGNORECASE)
+    # Truncate if too long
+    if len(redacted_content) > 500:
+        redacted_content = redacted_content[:500] + "..."
     
-    if not is_scam:
-        # No forbidden links found, use AI to analyze for other scam patterns
-        print(f"🔍 No forbidden link types detected. Analyzing {len(urls)} link(s) with AI for other scam patterns...")
-        is_scam, reason = await analyze_link_with_ai(message.content, urls)
-        print(f"🤖 AI Analysis Result: is_scam={is_scam}, reason='{reason}'")
-    
-    if not is_scam:
-        return False
-    
-    # Create vote message
-    vote_message_text = f"🚨 **Ban {message.author.mention} ({message.author.display_name})?**\nReason: {reason}\n\nReact ✅ to ban, ❌ to dismiss"
+    # Create vote message with evidence
+    vote_message_text = (
+        f"🚨 **Ban {message.author.mention} ({message.author.display_name})?**\n"
+        f"**Reason:** {reason}\n\n"
+        f"📝 **Their message (saved before deletion):**\n"
+        f"```{redacted_content}```\n"
+        f"React ✅ to ban, ❌ to dismiss"
+    )
     
     try:
         vote_message = await message.channel.send(vote_message_text)
@@ -297,68 +308,24 @@ async def handle_scam_detection(message):
         print(f"Error creating ban vote: {e}")
         return False
 
-def should_respond_to_message(content, author_id):
-    """Basic filters - don't respond to bots, commands, or empty messages."""
-    # Don't respond to bot messages
-    if author_id == client.user.id:
+def should_respond(message) -> bool:
+    """Basic sanity checks only. AI sees conversation history and decides."""
+    content = message.content
+    
+    # Don't respond to self
+    if message.author.id == client.user.id:
         return False
     
-    # Don't respond to commands
+    # Skip command messages (handled elsewhere)
     if content.startswith('!'):
         return False
     
-    # Don't respond to empty messages
+    # Skip empty messages
     if not content.strip():
         return False
     
+    # Let the AI see everything else and decide
     return True
-
-def has_obvious_trigger(content: str, message) -> bool:
-    """Quick implicit filter - like human skimming. Returns True if message catches attention."""
-    content_lower = content.lower()
-    
-    # Always respond to direct mentions
-    if client.user.mentioned_in(message):
-        return True
-    
-    # Always respond to replies to bot
-    if message.reference and message.reference.message_id:
-        try:
-            # We'll check if it's a reply to us in the main flow, but flag it here
-            return True
-        except:
-            pass
-    
-    # Question patterns
-    if '?' in content:
-        return True
-    
-    # Bot name mentioned
-    if BOT_NAME.lower() in content_lower:
-        return True
-    
-    # Explicit help requests
-    help_words = ['help', 'how do', 'how to', 'what is', 'what\'s', 'explain', 'tell me about', 'can you', 'could you']
-    if any(word in content_lower for word in help_words):
-        return True
-    
-    # Explicit price queries
-    price_patterns = ['price of', 'price for', 'what\'s the price', 'how much is', 'price?', 'cost']
-    if any(pattern in content_lower for pattern in price_patterns):
-        return True
-    
-    # Reaction requests
-    react_patterns = ['react', 'emoji', 'thumbs up', 'thumbsup', 'checkmark', 'like this', 'react to', 'react with']
-    if any(pattern in content_lower for pattern in react_patterns):
-        return True
-    
-    # AIPG/Power Grid related keywords (might need help)
-    aipg_keywords = ['aipg', 'power grid', 'staking', 'bridge', 'migration', 'worker', 'token']
-    if any(keyword in content_lower for keyword in aipg_keywords):
-        return True
-    
-    # Otherwise, skip (like human ignoring most messages)
-    return False
 
 def format_file_size(size_bytes):
     """Format file size in a human-readable format."""
@@ -377,8 +344,8 @@ def format_timestamp(timestamp):
 async def handle_help_command(message):
     """Handle the !help command."""
     help_embed = discord.Embed(
-        title="Grid Discord RAG Bot Help",
-        description="I can answer questions about AI Power Grid using stored documentation.",
+        title="aigarth Help",
+        description="I'm your AI-powered chat buddy for the AI Power Grid community! I can answer questions using stored documentation and live market data.",
         color=discord.Color.green()
     )
     
@@ -510,24 +477,22 @@ async def handle_delete_command(message):
         await message.channel.send(f"❌ Error deleting document: {str(e)}")
 
 async def classify_and_respond(message):
-    """Classify if the bot should respond and generate a natural response."""
+    """Main response handler. Stores messages and optionally responds."""
     content = message.content.strip()
     author_name = message.author.display_name
     
-    # Check basic conditions first
-    if not should_respond_to_message(content, message.author.id):
-        return False
-    
-    # Add the message to channel history (always save, but don't always process)
+    # Always save to history (both active and readonly channels)
     add_message(message.channel.id, author_name, content, author_id=message.author.id, is_bot=False)
     
-    # STAGE 1: Quick implicit filter (like human skimming)
-    if not has_obvious_trigger(content, message):
-        print(f"⏭️  Skipped (no obvious trigger): '{content[:50]}...'")
+    # Read-only channels: store only, don't respond
+    if message.channel.id in BOT_READONLY_CHANNELS:
         return False
     
-    # STAGE 2: Full processing (only if we got here - message caught attention)
-    print(f"\n🔍 Processing message: '{content}' from {author_name}")
+    # Single filter check
+    if not should_respond(message):
+        return False
+    
+    print(f"\n🔍 Processing: '{content[:80]}...' from {author_name}")
     
     try:
         # Get conversation history for context
@@ -539,10 +504,31 @@ async def classify_and_respond(message):
         # Get crypto market data if relevant
         crypto_context = await get_crypto_context(content)
         
+        # Extract link previews if message contains URLs
+        urls = extract_urls_from_message(content)
+        link_context = format_link_context(urls) if urls else ""
+        
         # Get mood, memories, and recent happenings
         mood_info = format_mood()
         memories_info = format_memories()
         happenings_info = format_recent_happenings()
+        
+        # Get chattiness level from memory
+        from conversation_db import get_memory
+        chattiness_raw = get_memory('chattiness_level')
+        chattiness_level = int(chattiness_raw) if chattiness_raw and chattiness_raw.isdigit() else 5  # Default to 5 (balanced)
+        
+        # Generate chattiness-specific guidance
+        chattiness_guidance = ""
+        if chattiness_level <= 3:
+            chattiness_guidance = "\n- Be selective - only respond to highly relevant messages or clear opportunities to help"
+        elif chattiness_level >= 7:
+            chattiness_guidance = "\n- Be more proactive - feel free to chime in on relevant discussions even if not directly asked\n- Share insights, add context, or contribute to ongoing topics when you have something valuable to add"
+        # 4-6: use default behavior (no extra guidance)
+        
+        # Get channel statuses (cross-channel awareness)
+        channel_statuses = format_channel_statuses(message.channel.id)
+        current_channel_status = get_channel_status(message.channel.id) or "No status yet - this is your first time here."
         
         # Get channel information
         channel_name = message.channel.name if hasattr(message.channel, 'name') else f"Channel {message.channel.id}"
@@ -560,69 +546,66 @@ async def classify_and_respond(message):
         current_time = datetime.datetime.now()
         timestamp = current_time.strftime("%B %d, %Y at %I:%M %p")
         
-        single_prompt = f"""
-You are {BOT_NAME}, a helpful Discord bot for AI Power Grid discussions.
+        single_prompt = f"""You are {BOT_NAME}, the AI assistant for the AI Power Grid community.
+
+WHO YOU ARE: You are powered by distributed LLM workers on the AI Power Grid network. Your responses are generated by decentralized GPU workers who earn AIPG tokens for providing inference. You're proof that the Grid works - a real AI running on community-powered infrastructure, not centralized cloud servers.
 
 Current time: {timestamp}
 
+=== CURRENT CHANNEL ===
 {channel_info}
+Your status note for this channel: {current_channel_status}
 
+=== YOUR STATE ===
 {mood_info}
 {memories_info}
-{happenings_info}
 
-Recent conversation:
+=== OTHER CHANNELS (background awareness) ===
+{channel_statuses}
+
+=== THIS CHANNEL'S CONVERSATION (your focus) ===
 {conversation_history}
 
 Latest message from {author_name}: "{content}"
 
-Context from AI Power Grid documentation:
+NOTE: Your Discord ID is {client.user.id}. If you see "<@{client.user.id}>" in the message above, that means YOU are being @mentioned - someone is talking directly to you! ALWAYS respond when mentioned!
+
+=== RELEVANT DOCUMENTATION ===
 {chr(10).join([f"[{i+1}] {item['text']}" for i, item in enumerate(context)])}
 {crypto_context}
+{link_context}
 
-DEFAULT BEHAVIOR: Stay quiet unless you have something valuable to add. Most messages don't need a response - that's normal and expected. Think like a human: you naturally stay quiet most of the time.
+=== BEHAVIOR ===
+IMPORTANT: The "Latest message" above is what you're responding to. Focus on THAT message, not old conversation history.
 
-Only respond when:
-- You're directly mentioned or asked a question
-- Someone needs help you can provide
-- You have relevant information that adds value
-- Someone asks you to react/acknowledge something
+Chattiness Level: {chattiness_level}/10
 
-DO NOT respond to:
-- Casual conversation between others
-- General statements that don't need acknowledgment
-- Messages where you don't have anything useful to add
-- Off-topic discussions unless directly asked
+Your name is "{BOT_NAME}". ALWAYS respond when:
+- You are @mentioned - someone is talking TO YOU, always reply!
+- Someone says your name "{BOT_NAME}" anywhere in the message - they want your attention, respond!
+- Someone asks you a direct question{chattiness_guidance}
 
-You are fun but informative, and you are a discord entity for the AI Power Grid community. You have a wealth of knowledge you can draw upon to answer questions and provide support.
+Stay quiet ONLY when:
+- People are clearly chatting with each other and NOT mentioning you at all
+- Random messages that have nothing to do with you
 
-IMPORTANT: Respond naturally in plain text. No templates, no structured formats, no embeds. Just talk like a normal person. If someone asks about crypto prices, just tell them naturally - don't use any special formatting or templates.
+Be natural and conversational. If someone just says "hey {BOT_NAME}" or "{BOT_NAME} are you there" - just say hi! Keep it simple.
 
-EMOJI REACTIONS: For short confirmations, affirmatives, or acknowledgments, prefer using emoji reactions instead of text messages. You can use any emoji that fits the situation - be creative! Common uses:
-- Confirmations/agreement: 👍 ✅ 👌
-- Disagreement/no: 👎 ❌
-- Appreciation: ❤️ 🙏
-- Excitement/celebration: 🎉 🔥 🚀
-- Or any other emoji that fits the context
+For quick acknowledgments, use emoji reactions (👍 ✅ 🎉 🔥 etc.) instead of long messages.
 
-Only send a text message if you need to provide information, ask a question, or explain something. For simple confirmations/acknowledgments, just react with an emoji.
+=== RESPONSE FORMAT ===
+Return JSON with these fields:
+- "respond": true/false (required)
+- "message": your response text (optional)
+- "react": emoji to react with (optional)
+- "channel_status": brief summary of what's happening in this channel now (optional but encouraged - helps you remember next time)
 
-If you decide that you should respond, return a JSON object like:
-{{"respond": true, "message": "your response here"}}
+Examples:
+{{"respond": true, "message": "The bridge is live on Base!", "channel_status": "Discussing Base bridge. User asking about migration."}}
+{{"respond": true, "react": "👍", "channel_status": "General chat, nothing urgent."}}
+{{"respond": false, "channel_status": "Users chatting about weekend plans."}}
 
-For short confirmations/affirmatives, prefer just reacting (use any appropriate emoji):
-{{"respond": true, "react": "👍"}}
-
-Or combine both if you need to say something AND acknowledge:
-{{"respond": true, "message": "your response here", "react": "👍"}}
-
-You can use any Discord emoji - be creative and pick what fits best!
-
-If you should NOT respond (most cases), return:
-{{"respond": false}}
-
-Only return valid JSON. Default to staying quiet - only respond when you have value to add.
-"""
+Only return valid JSON."""
         
         # Get response from Grid API (no typing indicator during decision)
         result = await grid_client.get_answer(single_prompt, [])
@@ -631,7 +614,6 @@ Only return valid JSON. Default to staying quiet - only respond when you have va
         
         # Try to parse JSON response
         try:
-            import json
             # Clean up the response to extract JSON
             result_clean = result.strip()
             if result_clean.startswith('```json'):
@@ -641,6 +623,12 @@ Only return valid JSON. Default to staying quiet - only respond when you have va
             result_clean = result_clean.strip()
             
             response_data = json.loads(result_clean)
+            
+            # Always update channel status if provided (even if not responding)
+            new_channel_status = response_data.get("channel_status")
+            if new_channel_status:
+                set_channel_status(message.channel.id, channel_name, new_channel_status)
+                print(f"📝 Updated #{channel_name} status: {new_channel_status}")
             
             if response_data.get("respond", False):
                 response_message = response_data.get("message", "")
@@ -716,7 +704,6 @@ Only return valid JSON. Default to staying quiet - only respond when you have va
                     
                     # Show typing indicator for 1-2 seconds before responding
                     async with message.channel.typing():
-                        import asyncio
                         await asyncio.sleep(1.5)  # 1.5 second delay
                     
                     # Send the response naturally
@@ -815,16 +802,128 @@ async def execute_ban(vote_message, vote_info):
 @client.event
 async def on_message(message):
     """Event called when a message is received."""
+    import sys
+    
     # Ignore messages from the bot itself
     if message.author == client.user:
         return
     
-    # Check for scam messages first
-    if await handle_scam_detection(message):
-        return  # Don't process further if scam detected
+    # Handle DMs from admin for memory management
+    if isinstance(message.channel, discord.DMChannel) and message.author.id == ADMIN_USER_ID:
+        content = message.content.strip()
+        
+        if content.startswith('!memory'):
+            from conversation_db import get_all_memories, save_memory, delete_memory
+            parts = content.split(maxsplit=2)
+            cmd = parts[1] if len(parts) > 1 else 'list'
+            
+            if cmd == 'list':
+                memories = get_all_memories()
+                if not memories:
+                    await message.reply("No memories stored.")
+                else:
+                    mem_text = "\n".join([f"**{m['key']}**: {m['value'][:100]}{'...' if len(m['value']) > 100 else ''}" for m in memories])
+                    await message.reply(f"🧠 **Memories ({len(memories)}):**\n{mem_text}")
+            
+            elif cmd == 'delete' and len(parts) > 2:
+                key = parts[2]
+                if delete_memory(key):
+                    await message.reply(f"✅ Deleted memory: `{key}`")
+                else:
+                    await message.reply(f"❌ Memory `{key}` not found")
+            
+            elif cmd == 'set' and len(parts) > 2:
+                # !memory set key=value
+                if '=' in parts[2]:
+                    key, value = parts[2].split('=', 1)
+                    save_memory(key.strip(), value.strip(), source="admin DM")
+                    await message.reply(f"✅ Saved: `{key.strip()}` = `{value.strip()[:50]}...`")
+                else:
+                    await message.reply("Usage: `!memory set key=value`")
+            
+            elif cmd == 'raw' and len(parts) > 2:
+                key = parts[2]
+                memories = get_all_memories()
+                mem = next((m for m in memories if m['key'] == key), None)
+                if mem:
+                    await message.reply(f"**{key}**:\n```{mem['value']}```")
+                else:
+                    await message.reply(f"❌ Memory `{key}` not found")
+            
+            else:
+                await message.reply("**Memory Commands:**\n`!memory list` - show all\n`!memory raw <key>` - show full text\n`!memory set key=value` - add/update\n`!memory delete <key>` - remove")
+            return
+        
+        # Handle chattiness control
+        if content.startswith('!chattiness'):
+            from conversation_db import save_memory, get_memory
+            parts = content.split(maxsplit=1)
+            
+            if len(parts) == 1:
+                # Show current chattiness
+                current = get_memory('chattiness_level')
+                if current:
+                    await message.reply(f"🗣️ Current chattiness: **{current}**")
+                else:
+                    await message.reply("🗣️ No chattiness level set (using default behavior)")
+            else:
+                try:
+                    level = int(parts[1])
+                    if 1 <= level <= 10:
+                        save_memory('chattiness_level', str(level), source="admin DM")
+                        descriptions = {
+                            1: "minimal - only when directly mentioned",
+                            2: "very quiet - rarely chimes in",
+                            3: "quiet - selective responses",
+                            4: "reserved - responds when relevant",
+                            5: "balanced - moderate participation",
+                            6: "engaged - regular participation",
+                            7: "active - frequent responses",
+                            8: "chatty - very responsive",
+                            9: "very chatty - eager to participate",
+                            10: "maximum - responds to almost everything"
+                        }
+                        desc = descriptions.get(level, "")
+                        await message.reply(f"✅ Chattiness set to **{level}/10** ({desc})")
+                    else:
+                        await message.reply("❌ Chattiness must be between 1-10")
+                except ValueError:
+                    await message.reply("❌ Usage: `!chattiness <1-10>` or `!chattiness` to view current level")
+            
+            return
+        
+        # Other DM messages from admin - just acknowledge
+        await message.reply("Use `!memory` commands to manage my memories, `!chattiness <1-10>` to control responsiveness, or @ me in a channel to teach me things.")
+        return
     
-    # Handle document management commands in allowed channels
-    if message.channel.id in ALLOWED_CHANNEL_IDS:
+    # Ignore channels not in our lists
+    channel_name = message.channel.name if hasattr(message.channel, 'name') else 'DM'
+    
+    # Debug: log ALL messages to see what's coming in
+    log_msg = f"📨 RAW: #{channel_name} ({message.channel.id}) from {message.author.display_name}: '{message.content[:50]}'"
+    print(log_msg, flush=True)
+    with open('bot.log', 'a') as f:
+        f.write(log_msg + '\n')
+    
+    if message.channel.id not in ALL_BOT_CHANNELS:
+        skip_msg = f"⏭️ SKIP: #{channel_name} ({message.channel.id}) - not in channel lists"
+        print(skip_msg, flush=True)
+        with open('bot.log', 'a') as f:
+            f.write(skip_msg + '\n')
+        return
+    
+    accept_msg = f"✅ ACCEPT: #{channel_name} from {message.author.display_name}"
+    print(accept_msg, flush=True)
+    with open('bot.log', 'a') as f:
+        f.write(accept_msg + '\n')
+    
+    # Check for scam messages first (only in active channels)
+    if message.channel.id in BOT_CHANNELS:
+        if await handle_scam_detection(message):
+            return  # Don't process further if scam detected
+    
+    # Handle document management commands in active channels
+    if message.channel.id in BOT_CHANNELS:
         # Handle help command
         if message.content.startswith(COMMANDS['help']):
             await handle_help_command(message)
@@ -844,82 +943,50 @@ async def on_message(message):
         if message.content.startswith(COMMANDS['delete']):
             await handle_delete_command(message)
             return
-    
-    # Handle direct file uploads (if user is admin and in allowed channel)
-    if (message.author.id == ADMIN_USER_ID and 
-        message.channel.id in ALLOWED_CHANNEL_IDS and 
-        message.attachments and 
-        not message.content.startswith('!')):
         
-        # If this appears to be just a file upload with no command
-        if not message.content or message.content.isspace():
-            await handle_upload_command(message)
-            return
-    
-    # Listen for messages in ALL channels (automatic classification)
-    # Return early if we already responded to avoid duplicate handling
-    if await classify_and_respond(message):
-        return
-    
-    # Handle replied messages regardless of channel
-    if message.reference and message.reference.message_id:
-        try:
-            # Get the message being replied to
-            referenced_message = await message.channel.fetch_message(message.reference.message_id)
-            
-            # Check if the referenced message is from our bot
-            if referenced_message.author == client.user:
-                # Extract the question from the reply
-                question = message.content.strip()
-                
-                # If no question was provided, ignore
-                if not question:
-                    return
-                
-                # Send a typing indicator to show the bot is processing
-                async with message.channel.typing():
-                    try:
-                        # Retrieve relevant documents
-                        context = retriever.get_relevant_context(question)
-                        
-                        # Send to Grid API for answer
-                        answer = await grid_client.get_answer(question, context)
-                        
-                        # Send natural text response (no embeds)
-                        await message.channel.send(answer)
-                    except Exception as e:
-                        await message.channel.send(f"Error: {str(e)}")
-                
-                # We've handled the reply, so return
+        # Handle direct file uploads (if user is admin)
+        if (message.author.id == ADMIN_USER_ID and 
+            message.attachments and 
+            not message.content.startswith('!')):
+            if not message.content or message.content.isspace():
+                await handle_upload_command(message)
                 return
-        except Exception as e:
-            print(f"Error handling reply: {str(e)}")
     
-    # Check if the bot is mentioned in the message (works in all channels)
-    if client.user.mentioned_in(message):
-        # Extract the question by removing the mention
-        content = message.content
-        mention = f'<@{client.user.id}>'
-        question = content.replace(mention, '').strip()
-        
-        # If no question was provided, show help message
-        if not question:
-            await handle_help_command(message)
-            return
-        
-        # Send a typing indicator to show the bot is processing
-        async with message.channel.typing():
+    # Admin @mention = store as fact
+    if message.author.id == ADMIN_USER_ID and client.user.mentioned_in(message):
+        # Extract the fact (remove the @mention)
+        fact_text = message.content.replace(f'<@{client.user.id}>', '').strip()
+        if fact_text:
+            # Have AI generate a short descriptive key
+            key_prompt = f"""Generate a short snake_case key (2-4 words, max 30 chars) to categorize this memory:
+
+"{fact_text}"
+
+Return ONLY the key, nothing else. Examples: polygon_grant_story, base_migration_info, polyvibe_details"""
+            
             try:
-                # Retrieve relevant documents
-                context = retriever.get_relevant_context(question)
-                
-                # Send to Grid API for answer
-                answer = await grid_client.get_answer(question, context)
-                
-                # Send natural text response (no embeds)
-                await message.channel.send(answer)
-            except Exception as e:
-                await message.channel.send(f"Error: {str(e)}")
+                key = await grid_client.get_answer(key_prompt, [])
+                key = key.strip().lower().replace(' ', '_')[:30]
+                # Fallback if AI returns something weird
+                if not key or len(key) < 3 or ' ' in key:
+                    words = fact_text.split()[:3]
+                    key = '_'.join(words).lower()[:30]
+            except:
+                words = fact_text.split()[:3]
+                key = '_'.join(words).lower()[:30]
+            
+            # Save to memory
+            from conversation_db import save_memory
+            save_memory(key, fact_text, source=f"admin ({message.author.display_name})")
+            
+            await message.add_reaction('🧠')
+            await message.reply(f"Got it! Saved as `{key}`", mention_author=False)
+            print(f"💾 Admin fact stored: {key} = {fact_text[:50]}...")
+            return
+    
+    # Process message (stores to DB, optionally responds)
+    # classify_and_respond will check if channel is readonly
+    await classify_and_respond(message)
 
 if __name__ == "__main__":
     client.run(DISCORD_TOKEN) 

@@ -41,4 +41,15 @@ Thumbs.db
 
 # GitHub deployment script
 github_push.sh
-COMMIT_MSG.txt 
+COMMIT_MSG.txt
+
+# Backups
+*.zip
+bot_backup_*/
+
+# Generated/temp files
+docs/*.html
+list_channels.py
+
+# Database files (local state)
+*.db
