@@ -53,3 +53,8 @@ list_channels.py
 
 # Database files (local state)
 *.db
+
+# Moltbook bot: post IDs we created (so we reply to comments)
+moltbook-bot/our_post_ids.txt
+# Moltbook engagement log (comments, DMs, replies)
+moltbook-bot/engagement.log
